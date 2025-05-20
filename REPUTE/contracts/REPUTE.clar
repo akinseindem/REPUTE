@@ -186,3 +186,119 @@
   )
 )
 
+;; Comprehensive dispute resolution function
+(define-public (resolve-dispute (dispute-id uint) (resolution-type (string-ascii 10)) (resolution-score (optional uint)))
+  (begin
+    ;; First check if the dispute exists
+    (let ((dispute (map-get? disputes { dispute-id: dispute-id })))
+      (if (is-some dispute)
+        (let (
+          (dispute-data (unwrap-panic dispute))
+          (current-block-height block-height)
+          (is-owner (is-eq tx-sender contract-owner))
+          (is-challenger (is-eq tx-sender (get challenger dispute-data)))
+          (is-target (is-eq tx-sender (get target dispute-data)))
+          (dispute-age (- current-block-height (get created-at dispute-data)))
+          (reputation-key { user: (get target dispute-data), domain-id: (get domain-id dispute-data) })
+          (current-rep-data (map-get? reputation-scores reputation-key))
+          (current-count (if (is-some current-rep-data)
+                            (get update-count (unwrap-panic current-rep-data))
+                            u0))
+        )
+          ;; Check if dispute is already resolved
+          (if (get resolved dispute-data)
+            (err err-no-dispute)
+            ;; Check if within dispute window
+            (if (> dispute-age dispute-window)
+              (err err-dispute-window-closed)
+              ;; Process based on resolution type
+              (if (is-eq resolution-type "accept")
+                (if is-target
+                  (begin
+                    ;; Update the reputation score with the proposed score
+                    (map-set reputation-scores 
+                      reputation-key
+                      { 
+                        score: (get proposed-score dispute-data), 
+                        last-updated: current-block-height,
+                        update-count: (+ current-count u1)
+                      }
+                    )
+                    
+                    ;; Mark dispute as resolved
+                    (map-set disputes
+                      { dispute-id: dispute-id }
+                      (merge dispute-data { 
+                        resolved: true, 
+                        resolution: (some (get proposed-score dispute-data)) 
+                      })
+                    )
+                    
+                    (ok true)
+                  )
+                  (err err-not-authorized)
+                )
+                (if (is-eq resolution-type "reject")
+                  (if is-target
+                    (begin
+                      ;; Mark dispute as resolved with original score
+                      (map-set disputes
+                        { dispute-id: dispute-id }
+                        (merge dispute-data { 
+                          resolved: true, 
+                          resolution: (some (get original-score dispute-data)) 
+                        })
+                      )
+                      
+                      (ok true)
+                    )
+                    (err err-not-authorized)
+                  )
+                  (if (is-eq resolution-type "arbitrate")
+                    (if is-owner
+                      (if (is-some resolution-score)
+                        (let ((final-score (unwrap-panic resolution-score)))
+                          ;; Validate the score
+                          (if (and (>= final-score min-score) (<= final-score max-score))
+                            (begin
+                              ;; Update the reputation score with the arbitrated score
+                              (map-set reputation-scores 
+                                reputation-key
+                                { 
+                                  score: final-score, 
+                                  last-updated: current-block-height,
+                                  update-count: (+ current-count u1)
+                                }
+                              )
+                              
+                              ;; Mark dispute as resolved
+                              (map-set disputes
+                                { dispute-id: dispute-id }
+                                (merge dispute-data { 
+                                  resolved: true, 
+                                  resolution: (some final-score) 
+                                })
+                              )
+                              
+                              (ok true)
+                            )
+                            (err err-invalid-score)
+                          )
+                        )
+                        (err err-invalid-score)
+                      )
+                      (err err-not-authorized)
+                    )
+                    (err err-not-authorized)
+                  )
+                )
+              )
+            )
+          )
+        )
+        (err err-no-dispute)
+      )
+    )
+  )
+)
+
