@@ -1,15 +1,188 @@
+;; REPUTE: Decentralized Reputation System
+;; A smart contract that manages user reputation in a decentralized manner
 
-;; REPUTE
-;; <add a description here>
+;; Constants
+(define-constant contract-owner tx-sender)
+(define-constant min-stake u1000000) ;; minimum stake required to participate
+(define-constant max-score u100) ;; maximum reputation score
+(define-constant min-score u0) ;; minimum reputation score
+(define-constant cooling-period u144) ;; ~24 hours in blocks
+(define-constant dispute-window u720) ;; ~5 days in blocks
 
-;; constants
-;;
+;; Error codes
+(define-constant err-not-authorized (err u100))
+(define-constant err-already-initialized (err u101))
+(define-constant err-insufficient-stake (err u102))
+(define-constant err-invalid-domain (err u103))
+(define-constant err-invalid-score (err u104))
+(define-constant err-cooling-period (err u105))
+(define-constant err-no-reputation (err u106))
+(define-constant err-dispute-exists (err u107))
+(define-constant err-no-dispute (err u108))
+(define-constant err-dispute-window-closed (err u109))
 
-;; data maps and vars
-;;
+;; Data maps
+(define-map user-stakes { user: principal } { amount: uint })
+(define-map domains { domain-id: uint } { name: (string-ascii 64), active: bool })
+(define-map reputation-scores 
+  { user: principal, domain-id: uint } 
+  { score: uint, last-updated: uint, update-count: uint })
+(define-map endorsements
+  { endorser: principal, endorsee: principal, domain-id: uint }
+  { weight: uint, timestamp: uint })
+(define-map disputes
+  { dispute-id: uint }
+  { 
+    challenger: principal, 
+    target: principal, 
+    domain-id: uint, 
+    original-score: uint, 
+    proposed-score: uint, 
+    created-at: uint, 
+    resolved: bool, 
+    resolution: (optional uint)
+  })
 
-;; private functions
-;;
+;; Variables
+(define-data-var dispute-counter uint u0)
+(define-data-var domain-counter uint u0)
 
-;; public functions
-;;
+;; Initialize domains
+(define-public (initialize-domains)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (asserts! (is-eq (var-get domain-counter) u0) err-already-initialized)
+    
+    ;; Initialize with some default domains
+    (map-set domains { domain-id: u1 } { name: "Technical Skills", active: true })
+    (map-set domains { domain-id: u2 } { name: "Communication", active: true })
+    (map-set domains { domain-id: u3 } { name: "Reliability", active: true })
+    (map-set domains { domain-id: u4 } { name: "Quality of Work", active: true })
+    
+    (var-set domain-counter u4)
+    (ok true)
+  )
+)
+
+;; Add a new domain
+(define-public (add-domain (name (string-ascii 64)))
+  (let ((new-id (+ (var-get domain-counter) u1)))
+    (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+    (map-set domains { domain-id: new-id } { name: name, active: true })
+    (var-set domain-counter new-id)
+    (ok new-id)
+  )
+)
+
+;; Stake tokens to participate
+(define-public (stake (amount uint))
+  (let ((current-stake (default-to u0 (get amount (map-get? user-stakes { user: tx-sender })))))
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set user-stakes { user: tx-sender } { amount: (+ current-stake amount) })
+    (ok (+ current-stake amount))
+  )
+)
+
+;; Update reputation score
+(define-public (update-reputation (target principal) (domain-id uint) (score uint))
+  (let (
+    (staked-amount (default-to u0 (get amount (map-get? user-stakes { user: tx-sender }))))
+    (domain (map-get? domains { domain-id: domain-id }))
+    (current-data (map-get? reputation-scores { user: target, domain-id: domain-id }))
+    (current-block-height block-height)
+    (current-count (if (is-some current-data)
+                      (get update-count (unwrap-panic current-data))
+                      u0))
+  )
+    ;; Validate inputs
+    (asserts! (>= staked-amount min-stake) err-insufficient-stake)
+    (asserts! (is-some domain) err-invalid-domain)
+    (asserts! (get active (unwrap-panic domain)) err-invalid-domain)
+    (asserts! (and (>= score min-score) (<= score max-score)) err-invalid-score)
+    
+    ;; Check cooling period if previous update exists
+    (if (is-some current-data)
+      (asserts! (>= current-block-height (+ (get last-updated (unwrap-panic current-data)) cooling-period)) err-cooling-period)
+      true
+    )
+    
+    ;; Update the reputation score
+    (map-set reputation-scores 
+      { user: target, domain-id: domain-id } 
+      { 
+        score: score, 
+        last-updated: current-block-height,
+        update-count: (+ current-count u1)
+      }
+    )
+    
+    (ok score)
+  )
+)
+
+;; Get reputation score
+(define-public (get-reputation (user principal) (domain-id uint))
+  (let ((reputation (map-get? reputation-scores { user: user, domain-id: domain-id })))
+    (if (is-some reputation)
+      (ok (get score (unwrap-panic reputation)))
+      (err err-no-reputation)
+    )
+  )
+)
+
+;; Add an endorsement
+(define-public (endorse (endorsee principal) (domain-id uint) (weight uint))
+  (let (
+    (staked-amount (default-to u0 (get amount (map-get? user-stakes { user: tx-sender }))))
+    (domain (map-get? domains { domain-id: domain-id }))
+  )
+    ;; Validate inputs
+    (asserts! (>= staked-amount min-stake) err-insufficient-stake)
+    (asserts! (is-some domain) err-invalid-domain)
+    (asserts! (get active (unwrap-panic domain)) err-invalid-domain)
+    (asserts! (and (> weight u0) (<= weight u10)) err-invalid-score)
+    
+    ;; Add the endorsement
+    (map-set endorsements
+      { endorser: tx-sender, endorsee: endorsee, domain-id: domain-id }
+      { weight: weight, timestamp: block-height }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Dispute resolution mechanism
+(define-public (create-dispute (target principal) (domain-id uint) (proposed-score uint))
+  (let (
+    (staked-amount (default-to u0 (get amount (map-get? user-stakes { user: tx-sender }))))
+    (reputation (map-get? reputation-scores { user: target, domain-id: domain-id }))
+    (dispute-id (+ (var-get dispute-counter) u1))
+  )
+    ;; Validate inputs
+    (asserts! (>= staked-amount (* min-stake u2)) err-insufficient-stake)
+    (asserts! (is-some reputation) err-no-reputation)
+    (asserts! (and (>= proposed-score min-score) (<= proposed-score max-score)) err-invalid-score)
+    
+    ;; Create the dispute
+    (map-set disputes
+      { dispute-id: dispute-id }
+      { 
+        challenger: tx-sender,
+        target: target,
+        domain-id: domain-id,
+        original-score: (get score (unwrap-panic reputation)),
+        proposed-score: proposed-score,
+        created-at: block-height,
+        resolved: false,
+        resolution: none
+      }
+    )
+    
+    ;; Update the dispute counter
+    (var-set dispute-counter dispute-id)
+    
+    (ok dispute-id)
+  )
+)
+
